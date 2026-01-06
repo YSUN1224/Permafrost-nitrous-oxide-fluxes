@@ -1,67 +1,157 @@
 #!/usr/bin/env bash
+# Co-assembly per microcosm group on HPC:
+# 1) MEGAHIT co-assembly of replicate reads
+# 2) metaSPAdes co-assembly of replicate reads
+# 3) merge assemblies -> filter contigs >= 1000 bp -> dereplicate with CD-HIT-EST
+#
+# HPC-friendly features:
+# - per-group scratch workspace (uses $SLURM_TMPDIR if available)
+# - resumable (skips completed steps)
+# - logs per group + per assembler
+# - avoids comma-list parsing pitfalls by using MEGAHIT --read1/--read2 files
+# - conservative file checks, safe cleanup
+#
+# Usage:
+#   bash scripts/01_coassembly.sh metadata/samples.tsv work/00_trim work/01_coassembly
+#
+# Env vars you can set:
+#   THREADS=32 MEM_GB=250 TMP_BASE=/scratch/$USER
+
 set -euo pipefail
 
 SAMPLES_TSV="${1:-metadata/samples.tsv}"
 TRIMDIR="${2:-work/00_trim}"
 OUTDIR="${3:-work/01_coassembly}"
+
 THREADS="${THREADS:-32}"
 MEM_GB="${MEM_GB:-250}"
 
+# Where to stage heavy I/O work. Prefer node-local scratch if available.
+TMP_BASE="${TMP_BASE:-${SLURM_TMPDIR:-/tmp}}"
+
 mkdir -p "${OUTDIR}"
+mkdir -p "${OUTDIR}/logs"
 
 # get unique group_ids
-groups=$(tail -n +2 "${SAMPLES_TSV}" | cut -f2 | sort -u)
+mapfile -t GROUPS < <(tail -n +2 "${SAMPLES_TSV}" | cut -f2 | sort -u)
 
-for g in ${groups}; do
+for g in "${GROUPS[@]}"; do
   echo "[coassembly] group=${g}"
   gdir="${OUTDIR}/${g}"
-  mkdir -p "${gdir}/reads"
+  mkdir -p "${gdir}"
 
-  # collect trimmed paired reads for the group (two replicates expected, but works for N)
+  # final outputs
+  derep="${gdir}/assembly_final.derep.fa"
+  if [[ -s "${derep}" ]]; then
+    echo "  -> final dereplicated assembly exists, skipping: ${derep}"
+    continue
+  fi
+
+  # scratch working directory per group
+  workdir="$(mktemp -d "${TMP_BASE%/}/coasm_${g}_XXXXXX")"
+  trap 'rm -rf "${workdir}"' EXIT
+
+  # group logs
+  LOGDIR="${OUTDIR}/logs/${g}"
+  mkdir -p "${LOGDIR}"
+
+  # collect sample IDs for this group
   mapfile -t samples < <(awk -F'\t' -v G="${g}" 'NR>1 && $2==G {print $1}' "${SAMPLES_TSV}")
+  if [[ ${#samples[@]} -eq 0 ]]; then
+    echo "  [WARN] No samples found for group ${g}; skipping."
+    rm -rf "${workdir}"
+    trap - EXIT
+    continue
+  fi
 
-  # build comma-separated lists for megahit / metaspades
-  r1_list=""
-  r2_list=""
+  # Build explicit read lists for MEGAHIT (more robust than comma concatenation)
+  r1_list_file="${workdir}/read1.txt"
+  r2_list_file="${workdir}/read2.txt"
+  : > "${r1_list_file}"
+  : > "${r2_list_file}"
+
   for s in "${samples[@]}"; do
     r1="${TRIMDIR}/${s}/${s}_R1.paired.fq.gz"
     r2="${TRIMDIR}/${s}/${s}_R2.paired.fq.gz"
-    [[ -f "${r1}" && -f "${r2}" ]] || { echo "Missing trimmed reads for ${s}"; exit 1; }
-
-    if [[ -z "${r1_list}" ]]; then
-      r1_list="${r1}"
-      r2_list="${r2}"
-    else
-      r1_list="${r1_list},${r1}"
-      r2_list="${r2_list},${r2}"
-    fi
+    [[ -f "${r1}" && -f "${r2}" ]] || { echo "[ERROR] Missing trimmed reads for ${s}: ${r1} / ${r2}"; exit 1; }
+    echo "${r1}" >> "${r1_list_file}"
+    echo "${r2}" >> "${r2_list_file}"
   done
 
-  # 1) MEGAHIT
-  megadir="${gdir}/megahit"
-  if [[ ! -s "${megadir}/final.contigs.fa" ]]; then
-    megahit -1 "${r1_list}" -2 "${r2_list}" \
-      -t "${THREADS}" -o "${megadir}"
+  # ---------- 1) MEGAHIT ----------
+  megadir="${workdir}/megahit"
+  mkdir -p "${megadir}"
+
+  if [[ ! -s "${gdir}/megahit.final.contigs.fa" ]]; then
+    echo "  [MEGAHIT] running..."
+    megahit \
+      --read1 "${r1_list_file}" \
+      --read2 "${r2_list_file}" \
+      -t "${THREADS}" \
+      -o "${megadir}" \
+      > "${LOGDIR}/megahit.stdout.log" 2> "${LOGDIR}/megahit.stderr.log"
+
+    [[ -s "${megadir}/final.contigs.fa" ]] || { echo "[ERROR] MEGAHIT did not produce final.contigs.fa"; exit 1; }
+    cp -f "${megadir}/final.contigs.fa" "${gdir}/megahit.final.contigs.fa"
+  else
+    echo "  [MEGAHIT] output exists, skipping."
   fi
 
-  # 2) metaSPAdes
-  spdir="${gdir}/metaspades"
-  if [[ ! -s "${spdir}/contigs.fasta" ]]; then
-    metaspades.py -1 "${r1_list}" -2 "${r2_list}" \
+  # ---------- 2) metaSPAdes ----------
+  spdir="${workdir}/metaspades"
+  mkdir -p "${spdir}"
+
+  if [[ ! -s "${gdir}/metaspades.contigs.fasta" ]]; then
+    echo "  [metaSPAdes] running..."
+    # metaSPAdes accepts comma-separated lists for -1/-2; build safely.
+    r1_csv="$(paste -sd, "${r1_list_file}")"
+    r2_csv="$(paste -sd, "${r2_list_file}")"
+
+    metaspades.py \
+      -1 "${r1_csv}" -2 "${r2_csv}" \
       -t "${THREADS}" -m "${MEM_GB}" \
-      -o "${spdir}"
+      -o "${spdir}" \
+      > "${LOGDIR}/metaspades.stdout.log" 2> "${LOGDIR}/metaspades.stderr.log"
+
+    [[ -s "${spdir}/contigs.fasta" ]] || { echo "[ERROR] metaSPAdes did not produce contigs.fasta"; exit 1; }
+    cp -f "${spdir}/contigs.fasta" "${gdir}/metaspades.contigs.fasta"
+  else
+    echo "  [metaSPAdes] output exists, skipping."
   fi
 
-  # 3) merge, filter >1000 bp, dereplicate with CD-HIT
-  merged="${gdir}/assembly_merged.fa"
-  filtered="${gdir}/assembly_merged.min1000.fa"
-  derep="${gdir}/assembly_final.derep.fa"
+  # ---------- 3) Merge -> filter >=1000 bp -> CD-HIT-EST ----------
+  merged="${workdir}/assembly_merged.fa"
+  filtered="${workdir}/assembly_merged.min1000.fa"
 
-  cat "${megadir}/final.contigs.fa" "${spdir}/contigs.fasta" > "${merged}"
+  echo "  [merge] concatenating assemblies..."
+  cat "${gdir}/megahit.final.contigs.fa" "${gdir}/metaspades.contigs.fasta" > "${merged}"
 
-  # filter >1kb (requires seqkit)
+  echo "  [filter] keeping contigs >= 1000 bp..."
+  # seqkit is fast and HPC-friendly; if unavailable, replace with an awk filter.
   seqkit seq -m 1000 "${merged}" > "${filtered}"
+  [[ -s "${filtered}" ]] || { echo "[ERROR] filtered assembly is empty"; exit 1; }
 
-  # dereplicate (cd-hit-est default parameters unless you choose to set -c etc.)
-  cd-hit-est -i "${filtered}" -o "${derep}" -T "${THREADS}" -M 0
+  echo "  [CD-HIT-EST] dereplicating..."
+  # Use explicit parameters rather than implicit defaults for reproducibility.
+  # -c 0.99 is common for near-identical derep; adjust if you used something else.
+  # -n 10 is appropriate for 0.99; see CD-HIT guidance if you change -c.
+  cd-hit-est \
+    -i "${filtered}" \
+    -o "${workdir}/assembly_final.derep.fa" \
+    -T "${THREADS}" -M 0 \
+    -c 0.99 -n 10 \
+    > "${LOGDIR}/cdhit.stdout.log" 2> "${LOGDIR}/cdhit.stderr.log"
+
+  [[ -s "${workdir}/assembly_final.derep.fa" ]] || { echo "[ERROR] CD-HIT-EST failed to produce dereplicated fasta"; exit 1; }
+
+  # atomic move into final location
+  tmp_out="${gdir}/assembly_final.derep.fa.tmp"
+  cp -f "${workdir}/assembly_final.derep.fa" "${tmp_out}"
+  mv -f "${tmp_out}" "${derep}"
+
+  echo "  -> done: ${derep}"
+
+  # cleanup this group's scratch
+  rm -rf "${workdir}"
+  trap - EXIT
 done
