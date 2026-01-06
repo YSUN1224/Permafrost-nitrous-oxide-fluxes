@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SAMPLES_TSV="${1:-metadata/samples.tsv}"
+TRIMDIR="${2:-work/00_trim}"
+OUTDIR="${3:-work/01_coassembly}"
+THREADS="${THREADS:-32}"
+MEM_GB="${MEM_GB:-250}"
+
+mkdir -p "${OUTDIR}"
+
+# get unique group_ids
+groups=$(tail -n +2 "${SAMPLES_TSV}" | cut -f2 | sort -u)
+
+for g in ${groups}; do
+  echo "[coassembly] group=${g}"
+  gdir="${OUTDIR}/${g}"
+  mkdir -p "${gdir}/reads"
+
+  # collect trimmed paired reads for the group (two replicates expected, but works for N)
+  mapfile -t samples < <(awk -F'\t' -v G="${g}" 'NR>1 && $2==G {print $1}' "${SAMPLES_TSV}")
+
+  # build comma-separated lists for megahit / metaspades
+  r1_list=""
+  r2_list=""
+  for s in "${samples[@]}"; do
+    r1="${TRIMDIR}/${s}/${s}_R1.paired.fq.gz"
+    r2="${TRIMDIR}/${s}/${s}_R2.paired.fq.gz"
+    [[ -f "${r1}" && -f "${r2}" ]] || { echo "Missing trimmed reads for ${s}"; exit 1; }
+
+    if [[ -z "${r1_list}" ]]; then
+      r1_list="${r1}"
+      r2_list="${r2}"
+    else
+      r1_list="${r1_list},${r1}"
+      r2_list="${r2_list},${r2}"
+    fi
+  done
+
+  # 1) MEGAHIT
+  megadir="${gdir}/megahit"
+  if [[ ! -s "${megadir}/final.contigs.fa" ]]; then
+    megahit -1 "${r1_list}" -2 "${r2_list}" \
+      -t "${THREADS}" -o "${megadir}"
+  fi
+
+  # 2) metaSPAdes
+  spdir="${gdir}/metaspades"
+  if [[ ! -s "${spdir}/contigs.fasta" ]]; then
+    metaspades.py -1 "${r1_list}" -2 "${r2_list}" \
+      -t "${THREADS}" -m "${MEM_GB}" \
+      -o "${spdir}"
+  fi
+
+  # 3) merge, filter >1000 bp, dereplicate with CD-HIT
+  merged="${gdir}/assembly_merged.fa"
+  filtered="${gdir}/assembly_merged.min1000.fa"
+  derep="${gdir}/assembly_final.derep.fa"
+
+  cat "${megadir}/final.contigs.fa" "${spdir}/contigs.fasta" > "${merged}"
+
+  # filter >1kb (requires seqkit)
+  seqkit seq -m 1000 "${merged}" > "${filtered}"
+
+  # dereplicate (cd-hit-est default parameters unless you choose to set -c etc.)
+  cd-hit-est -i "${filtered}" -o "${derep}" -T "${THREADS}" -M 0
+done
