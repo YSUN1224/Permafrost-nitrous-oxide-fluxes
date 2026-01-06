@@ -1,0 +1,20 @@
+metawrap binning has several binning softwares for you to choose. You can just use one binning software. Here we will use three binning softwares: MetaBAT2, MaxBin2 and CONCOCT. Later we will use the bin_refinement command to consolidate bins from the three softwares.
+
+You can also run metabat2, maxbin2 and concoct binning separately without using metawrap. If you do so, first you need to map your clean reads back to the contigs using bowtie2, BBMap or other mapping softwares, then you follow the instructions from binning softwares. metawrap binning here does two steps: 1. binning with the selected softwares; 2. check the quality of recovered bins using checkM.
+
+emacs binning.sh  
+#!/bin/bash
+#SBATCH -J binning
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=8
+#SBATCH --partition=bigmem
+#SBATCH --time=0-10:00:00
+#SBATCH --error=binning.e%J
+#SBATCH --output=binning.o%J
+#SBATCH --mail-user=your_email_address
+#SBATCH --mail-type=ALL
+conda activate metawrap-env
+metawrap binning -o INITIAL_BINNING -t 32 -a ASSEMBLY_megahit/final_assembly.fasta --metabat2 --maxbin2 --concoct CLEAN_READS/ERR*fastq --universal
+Submit after assembly_megahit is completed. ~2.5 hours run
+
+sbatch binning.sh 
