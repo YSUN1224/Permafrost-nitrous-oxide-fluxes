@@ -1,0 +1,30 @@
+# install mamba (replaces conda, but much faster):
+ conda install -y mamba 
+ 
+# install metawrap: We will create an conda virtual environment called metawrap-env for metawrap installation. 
+ mamba create -y --name metawrap-env --channel ursky metawrap-mg=1.3.2
+ conda activate metawrap-env
+
+# To fix the CONCOCT endless warning messages in metaWRAP=1.2+, run
+ conda install -y blas=2.5=mkl
+
+# download checkm database. checkM database is to check quality of metagenome-assembled genome
+mkdir database
+mkdir database/checkm_database
+
+# Now manually download the database:
+cd database/checkm_database
+wget https://data.ace.uq.edu.au/public/CheckM_databases/checkm_data_2015_01_16.tar.gz
+tar -xvf *.tar.gz
+rm *.gz
+cd ../../
+
+# Now tell CheckM where to find this data 
+checkm data setRoot     # CheckM will prompt to to chose your storage location: can use database/checkm_database as the location
+# If the above did not work, you can try:
+checkm data setRoot database/checkm_database
+
+# NOTE: if you do other metawrap steps that are not included here, you need to download additional databases, such as kraken database for taxonomic annotation.  
+
+# deactivate metawrap-env environment
+ conda deactivate
