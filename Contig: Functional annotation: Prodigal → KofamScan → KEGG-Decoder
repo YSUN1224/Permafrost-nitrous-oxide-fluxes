@@ -1,0 +1,240 @@
+## annotation
+
+#!/usr/bin/env bash
+#SBATCH -J funcAnno
+#SBATCH -c 16
+#SBATCH --mem=64G
+#SBATCH -t 24:00:00
+#SBATCH -o logs/funcAnno_%j.out
+#SBATCH -e logs/funcAnno_%j.err
+
+set -euo pipefail
+mkdir -p logs
+
+# Inputs
+SAMPLES_TSV="${1:-metadata/samples.tsv}"
+ASSEMDIR="${2:-work/01_coassembly}"
+OUTDIR="${3:-work/20_func_annotation}"
+
+# Databases / tools (set these paths on your HPC)
+KOFAM_PROFILES="${KOFAM_PROFILES:-/path/to/kofamscan/profiles}"     # directory "profiles/"
+KOFAM_KOLIST="${KOFAM_KOLIST:-/path/to/kofamscan/ko_list}"          # file "ko_list"
+KOALA_DEFS="${KOALA_DEFS:-/path/to/KEGG-Decoder/KOALA_definitions.txt}"
+
+THREADS="${THREADS:-${SLURM_CPUS_PER_TASK:-16}}"
+mkdir -p "${OUTDIR}"
+
+# Unique groups from samples.tsv (group_id is 2nd column)
+mapfile -t GROUPS < <(awk 'NR>1{print $2}' "${SAMPLES_TSV}" | sort -u)
+
+for g in "${GROUPS[@]}"; do
+  echo "[group] ${g}"
+  g_in="${ASSEMDIR}/${g}/assembly_final.derep.fa"
+  [[ -s "${g_in}" ]] || { echo "[WARN] missing assembly: ${g_in} (skip)"; continue; }
+
+  g_out="${OUTDIR}/${g}"
+  mkdir -p "${g_out}"
+
+  # ---------- 1) Prodigal (metagenomic gene calling) ----------
+  proteins="${g_out}/${g}.prodigal.faa"
+  genes_nt="${g_out}/${g}.prodigal.fna"
+  gff="${g_out}/${g}.prodigal.gff"
+
+  if [[ ! -s "${proteins}" ]]; then
+    echo "  [Prodigal] calling CDS..."
+    prodigal \
+      -i "${g_in}" \
+      -p meta \
+      -a "${proteins}" \
+      -d "${genes_nt}" \
+      -o "${gff}" \
+      1> "${g_out}/prodigal.stdout.log" \
+      2> "${g_out}/prodigal.stderr.log"
+  else
+    echo "  [Prodigal] exists, skipping."
+  fi
+
+  # ---------- 2) KofamScan (KO assignment) ----------
+  # Output: detailed TSV; one row per protein hit
+  kofam_tsv="${g_out}/${g}.kofamscan.detail.tsv"
+  kofam_hits="${g_out}/${g}.kofamscan.hits.tsv"
+  ko_list="${g_out}/${g}.KO.list"  # unique KO IDs for KEGG-Decoder
+
+  if [[ ! -s "${kofam_tsv}" ]]; then
+    echo "  [KofamScan] assigning KOs..."
+    exec_annotation \
+      -o "${kofam_tsv}" \
+      -f detail-tsv \
+      --cpu "${THREADS}" \
+      -p "${KOFAM_PROFILES}" \
+      -k "${KOFAM_KOLIST}" \
+      "${proteins}" \
+      1> "${g_out}/kofamscan.stdout.log" \
+      2> "${g_out}/kofamscan.stderr.log"
+  else
+    echo "  [KofamScan] exists, skipping."
+  fi
+
+  # Parse KO hits from detail TSV:
+  # KofamScan detail TSV usually has a "ko" column; we keep non-empty KO entries.
+  if [[ ! -s "${ko_list}" ]]; then
+    echo "  [Parse] extracting KO list..."
+    python3 - <<'PY'
+import pandas as pd, sys
+tsv=sys.argv[1]
+out_hits=sys.argv[2]
+out_kolist=sys.argv[3]
+
+df=pd.read_csv(tsv, sep="\t", comment="#", dtype=str)
+# find KO column robustly
+ko_col=None
+for c in df.columns:
+    if c.lower() in ("ko","k_number","knum","kegg_ko"):
+        ko_col=c; break
+if ko_col is None:
+    # sometimes column is literally "k_number" or inside "query_name"/"hit"
+    # fail loudly so you can inspect the header once on your HPC
+    raise SystemExit(f"Cannot find KO column in {tsv}. Columns={list(df.columns)}")
+
+df=df[df[ko_col].notna() & (df[ko_col].astype(str).str.startswith("K"))]
+# save hit table
+df.to_csv(out_hits, sep="\t", index=False)
+# unique KO list (presence/absence)
+kos=sorted(set(df[ko_col].astype(str)))
+with open(out_kolist,"w") as f:
+    for k in kos:
+        f.write(k+"\n")
+print(f"Wrote {out_hits} and {out_kolist} (nKO={len(kos)})")
+PY \
+    "${kofam_tsv}" "${kofam_hits}" "${ko_list}"
+  fi
+
+  # ---------- 3) KEGG-Decoder (pathway completeness) ----------
+  # KEGG-Decoder can take a file with KO identifiers; many users run it per sample/genome.
+  # Here we run it per co-assembly group and point to KOALA_definitions.
+  keggdecoder_out="${g_out}/${g}.keggdecoder.tsv"
+
+  if [[ ! -s "${keggdecoder_out}" ]]; then
+    echo "  [KEGG-Decoder] computing pathway completeness..."
+    KEGG_decoder.py \
+      -i "${ko_list}" \
+      -o "${keggdecoder_out}" \
+      -d "${KOALA_DEFS}" \
+      1> "${g_out}/keggdecoder.stdout.log" \
+      2> "${g_out}/keggdecoder.stderr.log"
+  else
+    echo "  [KEGG-Decoder] exists, skipping."
+  fi
+
+  echo "  -> done: ${g_out}"
+done
+
+echo "All groups finished."
+
+
+## nosZ mapping to ROCker nosZ reference sequences (read recruitment)
+
+#!/usr/bin/env bash
+#SBATCH -J nosZmap
+#SBATCH -c 8
+#SBATCH --mem=24G
+#SBATCH -t 08:00:00
+#SBATCH -o logs/nosZ_%A_%a.out
+#SBATCH -e logs/nosZ_%A_%a.err
+#SBATCH --array=1-999%60
+
+set -euo pipefail
+mkdir -p logs
+
+SAMPLES_TSV="${1:-metadata/samples.tsv}"
+TRIMDIR="${2:-work/00_trim}"
+OUTDIR="${3:-work/21_nosZ_mapping}"
+
+# Curated nosZ reference fasta from ROCker models DB (you provide this file)
+NOSZ_FASTA="${NOSZ_FASTA:-/path/to/ROCKer_models/nosZ_curated_refs.fasta}"
+
+THREADS="${THREADS:-${SLURM_CPUS_PER_TASK:-8}}"
+mkdir -p "${OUTDIR}"
+
+# sample selection
+LINE=$(awk -v n="$SLURM_ARRAY_TASK_ID" 'NR==n+1{print; exit}' "${SAMPLES_TSV}")
+[[ -n "${LINE}" ]] || { echo "No sample line for task ${SLURM_ARRAY_TASK_ID}"; exit 0; }
+sample_id=$(echo "${LINE}" | cut -f1)
+
+r1="${TRIMDIR}/${sample_id}/${sample_id}_R1.paired.fq.gz"
+r2="${TRIMDIR}/${sample_id}/${sample_id}_R2.paired.fq.gz"
+[[ -f "${r1}" && -f "${r2}" ]] || { echo "Missing trimmed reads for ${sample_id}"; exit 1; }
+[[ -s "${NOSZ_FASTA}" ]] || { echo "Missing nosZ reference FASTA: ${NOSZ_FASTA}"; exit 1; }
+
+# Build bowtie2 index once (shared across array tasks)
+IDX_PREFIX="${OUTDIR}/nosZ_ref.bt2"
+if [[ ! -f "${IDX_PREFIX}.1.bt2" && ! -f "${IDX_PREFIX}.1.bt2l" ]]; then
+  echo "[index] building bowtie2 index..."
+  bowtie2-build "${NOSZ_FASTA}" "${IDX_PREFIX}" \
+    1> "${OUTDIR}/bowtie2-build.stdout.log" \
+    2> "${OUTDIR}/bowtie2-build.stderr.log"
+fi
+
+# Map reads
+bam="${OUTDIR}/${sample_id}.nosZ.bam"
+stats="${OUTDIR}/${sample_id}.nosZ.counts.tsv"
+
+if [[ ! -s "${bam}" ]]; then
+  echo "[map] ${sample_id}"
+  bowtie2 \
+    -x "${IDX_PREFIX}" \
+    -1 "${r1}" -2 "${r2}" \
+    -p "${THREADS}" \
+    --very-sensitive \
+    2> "${OUTDIR}/${sample_id}.bowtie2.log" \
+  | samtools view -bS -@ "${THREADS}" - \
+  | samtools sort -@ "${THREADS}" -o "${bam}" -
+
+  samtools index -@ "${THREADS}" "${bam}"
+fi
+
+# Count mapped reads (primary alignments; exclude unmapped)
+mapped=$(samtools view -@ "${THREADS}" -c -F 4 "${bam}")
+total=$(python3 - <<PY
+import gzip,sys
+def c(p):
+  n=0
+  with gzip.open(p,'rt') as f:
+    for _ in f: n+=1
+  return n//4
+r1="${r1}"; r2="${r2}"
+print(c(r1)+c(r2))
+PY
+)
+
+# write per-sample summary
+echo -e "sample_id\tmapped_reads_to_nosZ\ttotal_trimmed_reads\trelative_read_recruitment" > "${stats}"
+python3 - <<PY >> "${stats}"
+s="${sample_id}"
+m=int("${mapped}")
+t=int("${total}")
+rel=(m/t) if t>0 else 0.0
+print(f"{s}\t{m}\t{t}\t{rel:.8e}")
+PY
+
+echo "Done: ${sample_id}"
+
+N=$(($(wc -l < metadata/samples.tsv) - 1))
+export NOSZ_FASTA=/path/to/ROCKer_models/nosZ_curated_refs.fasta
+sbatch --array=1-${N}%60 scripts/21_map_nosz_rocker_array.sbatch metadata/samples.tsv work/00_trim work/21_nosZ_mapping
+
+## Combine all per-sample nosZ tables
+
+#!/usr/bin/env bash
+set -euo pipefail
+OUTDIR="${1:-work/21_nosZ_mapping}"
+OUT="${2:-work/21_nosZ_mapping/nosZ_read_recruitment_all_samples.tsv}"
+
+head -n 1 "$(ls -1 "${OUTDIR}"/*.nosZ.counts.tsv | head -n 1)" > "${OUT}"
+for f in "${OUTDIR}"/*.nosZ.counts.tsv; do
+  tail -n +2 "${f}" >> "${OUT}"
+done
+
+echo "Wrote ${OUT}"
+
+bash scripts/22_merge_nosz_counts.sh work/21_nosZ_mapping
