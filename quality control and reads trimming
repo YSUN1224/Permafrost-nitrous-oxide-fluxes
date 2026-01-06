@@ -1,63 +1,27 @@
+#!/usr/bin/env bash
+#SBATCH -J trim
+#SBATCH -c 8
+#SBATCH --mem=24G
+#SBATCH -t 06:00:00
+#SBATCH -o logs/trim_%A_%a.out
+#SBATCH -e logs/trim_%A_%a.err
+#SBATCH --array=1-999%50
 
-emacs read_trim.sh
-#!/bin/bash
-#SBATCH --partition=compute           
-#SBATCH --job-name=read_trim       
-#SBATCH --mail-type=ALL               
-#SBATCH --mail-user=your email   
-#SBATCH --ntasks=12                    
-#SBATCH --cpus-per-task=1 
-#SBATCH --nodes=2  
-#SBATCH --ntasks-per-node=12
-#SBATCH --ntasks-per-socket=6
-#SBATCH --mem=10gb                     
-#SBATCH --time=23:59:00               
-#SBATCH --output=read_trim_%j.err   
-#SBATCH --output=read_trim_%j.out
+set -euo pipefail
 
-cd $PBS_O_WORKDIR
+TSV="metadata/samples.tsv"
+TRIMDIR="work/00_trim"
+mkdir -p logs "$TRIMDIR"
 
-# Activate an environment that has trimmomatic installed
-# (change this to your environment name)
-conda activate metawrap-env
+# pick the Nth sample row (skip header)
+LINE=$(awk -v n=$SLURM_ARRAY_TASK_ID 'NR==n+1{print; exit}' "$TSV")
+[[ -n "$LINE" ]] || { echo "No line for task $SLURM_ARRAY_TASK_ID"; exit 0; }
 
-mkdir -p TRIMMOMATIC_OUT
+sample_id=$(echo "$LINE" | cut -f1)
 
-# Path to adapter file (adjust to where Trimmomatic keeps adapters on your system)
-# Common locations:
-#   $CONDA_PREFIX/share/trimmomatic/adapters/TruSeq3-PE.fa
-#   /path/to/Trimmomatic/adapters/TruSeq3-PE.fa
-ADAPTERS="$CONDA_PREFIX/share/trimmomatic/adapters/TruSeq3-PE.fa"
+export THREADS=$SLURM_CPUS_PER_TASK
+bash scripts/00_trim_trimmomatic.sh "$TSV" "$TRIMDIR"
+echo "Done trimming (task sample: $sample_id)"
 
-# If your raw files are .fastq (not gzipped), keep them as-is
-# If you have .fastq.gz, change the loop pattern accordingly
-for r1 in RAW_READS/*_1.fastq; do
-  sample=$(basename "$r1" _1.fastq)
-  r2="RAW_READS/${sample}_2.fastq"
-
-  outdir="TRIMMOMATIC_OUT/${sample}"
-  mkdir -p "$outdir"
-
-  # Paired outputs (recommended for downstream assembly/metagenomics)
-  out_p1="${outdir}/${sample}_1.trim.paired.fastq"
-  out_u1="${outdir}/${sample}_1.trim.unpaired.fastq"
-  out_p2="${outdir}/${sample}_2.trim.paired.fastq"
-  out_u2="${outdir}/${sample}_2.trim.unpaired.fastq"
-
-  # Trimmomatic PE trimming
-  # -phred33 is typical for NovaSeq
-  # SLIDINGWINDOW:4:20 is a common default
-  # MINLEN can be adjusted (50 for 2x150; 36-40 for shorter read lengths)
-  trimmomatic PE -threads 8 -phred33 \
-    "$r1" "$r2" \
-    "$out_p1" "$out_u1" \
-    "$out_p2" "$out_u2" \
-    ILLUMINACLIP:"$ADAPTERS":2:30:10 \
-    LEADING:3 TRAILING:3 SLIDINGWINDOW:4:20 \
-    MINLEN:50
-
-done
-
-
-# submit
-sbatch read_trim.sh
+N=$(($(wc -l < metadata/samples.tsv) - 1))
+sbatch --array=1-${N}%50 slurm/trim.sbatch
