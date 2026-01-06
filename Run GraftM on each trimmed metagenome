@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+#SBATCH -J graftm16S
+#SBATCH -c 8
+#SBATCH --mem=32G
+#SBATCH -t 12:00:00
+#SBATCH -o logs/graftm_%A_%a.out
+#SBATCH -e logs/graftm_%A_%a.err
+#SBATCH --array=1-999%50
+
+set -euo pipefail
+
+SAMPLES_TSV="${1:-metadata/samples.tsv}"
+TRIMDIR="${2:-work/00_trim}"
+OUTDIR="${3:-work/10_graftm_16s}"
+# Path to a Greengenes 13_8 97% GraftM package (*.gpkg)
+GPKG="${GPKG:-/path/to/gg_13_8_97.gpkg}"
+
+THREADS="${THREADS:-${SLURM_CPUS_PER_TASK:-8}}"
+mkdir -p logs "${OUTDIR}"
+
+# Pick sample by array index (skip header)
+LINE=$(awk -v n="$SLURM_ARRAY_TASK_ID" 'NR==n+1{print; exit}' "${SAMPLES_TSV}")
+[[ -n "${LINE}" ]] || { echo "No sample line for task ${SLURM_ARRAY_TASK_ID}"; exit 0; }
+sample_id=$(echo "${LINE}" | cut -f1)
+
+r1="${TRIMDIR}/${sample_id}/${sample_id}_R1.paired.fq.gz"
+r2="${TRIMDIR}/${sample_id}/${sample_id}_R2.paired.fq.gz"
+[[ -f "${r1}" && -f "${r2}" ]] || { echo "Missing reads: ${r1} ${r2}"; exit 1; }
+[[ -f "${GPKG}" ]] || { echo "Missing GraftM package: ${GPKG}"; exit 1; }
+
+sout="${OUTDIR}/${sample_id}"
+mkdir -p "${sout}"
+
+# GraftM works best if you give it paired reads as a single interleaved file OR as separate inputs.
+# Many installations accept: --forward --reverse. If yours doesn't, interleave first.
+# Below uses forward/reverse (most common).
+graftM graft \
+  --forward "${r1}" \
+  --reverse "${r2}" \
+  --graftm_package "${GPKG}" \
+  --output_directory "${sout}" \
+  --threads "${THREADS}" \
+  --search_method hmmsearch \
+  --assignment_method pplacer \
+  --verbosity 2
+
+echo "Done: ${sample_id}"
+
+N=$(($(wc -l < metadata/samples.tsv) - 1))
+sbatch --array=1-${N}%50 scripts/10_graftm_16s_gg97_array.sbatch metadata/samples.tsv work/00_trim work/10_graftm_16s
+
+
+
+## Build an OTU table + relative abundance + phylum/family summaries
+
+#!/usr/bin/env python3
+import glob
+import os
+import re
+import sys
+import pandas as pd
+
+def find_assignment_table(sample_dir: str) -> str:
+    """
+    Try to locate a graftM output table that includes assignments + counts.
+    This is intentionally flexible because graftM output filenames can vary by package/version.
+    """
+    candidates = []
+    patterns = [
+        "*assignment*.tsv",
+        "*assign*.tsv",
+        "*otu*.tsv",
+        "*read*.tsv",
+        "*tax*.tsv",
+        "*counts*.tsv",
+    ]
+    for pat in patterns:
+        candidates.extend(glob.glob(os.path.join(sample_dir, "**", pat), recursive=True))
+    # Prefer smaller "final" tables, not giant intermediates
+    candidates = sorted(set(candidates), key=lambda p: (("intermediate" in p.lower()), len(p)))
+    return candidates[0] if candidates else ""
+
+def normalize_tax(tax: str):
+    # Greengenes-like tax strings often come as semicolon-separated ranks
+    # We extract phylum + family if present.
+    # Examples: "k__Bacteria; p__Proteobacteria; c__...; o__...; f__Enterobacteriaceae; ..."
+    phylum = None
+    family = None
+    parts = [p.strip() for p in re.split(r"[;|]", str(tax)) if p.strip()]
+    for p in parts:
+        if p.startswith(("p__", "phylum__")):
+            phylum = p.split("__", 1)[-1]
+        if p.startswith(("f__", "family__")):
+            family = p.split("__", 1)[-1]
+    return phylum, family
+
+def main(graftm_dir: str, trim_counts_tsv: str, out_prefix: str):
+    """
+    Inputs:
+      graftm_dir: work/10_graftm_16s/<sample_id>/
+      trim_counts_tsv: a TSV with sample_id and total_trimmed_reads (paired reads count)
+    Outputs:
+      <prefix>.otu_counts.tsv
+      <prefix>.otu_rel_abundance.tsv
+      <prefix>.phylum_rel_abundance.tsv
+      <prefix>.family_rel_abundance.tsv
+    """
+    totals = pd.read_csv(trim_counts_tsv, sep="\t")
+    totals = dict(zip(totals["sample_id"], totals["total_trimmed_reads"]))
+
+    otu_counts = {}   # (sample -> series of OTU counts)
+    otu_tax = {}      # OTU -> taxonomy string (best effort)
+
+    sample_dirs = sorted([d for d in glob.glob(os.path.join(graftm_dir, "*")) if os.path.isdir(d)])
+    if not sample_dirs:
+        raise SystemExit(f"No sample directories found under {graftm_dir}")
+
+    for sd in sample_dirs:
+        sample = os.path.basename(sd.rstrip("/"))
+        tab = find_assignment_table(sd)
+        if not tab:
+            raise SystemExit(f"Could not find an assignment/count table for {sample} in {sd}")
+
+        df = pd.read_csv(tab, sep="\t", dtype=str)
+        # Try to infer columns
+        cols = {c.lower(): c for c in df.columns}
+
+        # Common patterns:
+        # - an OTU identifier column: 'otu', 'cluster', 'reference', 'name', 'id'
+        # - a taxonomy column: 'taxonomy', 'tax', 'assignment'
+        # - a count column: 'count', 'reads', 'n', 'num_reads'
+        otu_col = next((cols[k] for k in cols if k in ["otu", "cluster", "reference", "id", "name"]), None)
+        tax_col = next((cols[k] for k in cols if "tax" in k or "assign" in k), None)
+        cnt_col = next((cols[k] for k in cols if k in ["count", "reads", "n", "num_reads", "read_count"]), None)
+
+        if otu_col is None or cnt_col is None:
+            raise SystemExit(
+                f"Could not infer OTU/count columns in {tab}. Columns: {list(df.columns)}"
+            )
+
+        # Clean count to int
+        df[cnt_col] = pd.to_numeric(df[cnt_col], errors="coerce").fillna(0).astype(int)
+        df[otu_col] = df[otu_col].astype(str)
+
+        # Aggregate counts per OTU
+        s_counts = df.groupby(otu_col)[cnt_col].sum()
+
+        otu_counts[sample] = s_counts
+
+        if tax_col is not None:
+            # Keep first taxonomy string per OTU (or the most frequent if you prefer)
+            tmp = df[[otu_col, tax_col]].dropna()
+            for otu, sub in tmp.groupby(otu_col):
+                if otu not in otu_tax:
+                    otu_tax[otu] = sub[tax_col].iloc[0]
+
+    # Build OTU count table (rows=OTU, cols=samples)
+    otu_count_df = pd.DataFrame(otu_counts).fillna(0).astype(int)
+    otu_count_df.index.name = "OTU"
+
+    otu_count_path = f"{out_prefix}.otu_counts.tsv"
+    otu_count_df.to_csv(otu_count_path, sep="\t")
+
+    # Relative abundance = OTU reads / total trimmed reads for that library
+    rel = otu_count_df.copy().astype(float)
+    for sample in rel.columns:
+        denom = totals.get(sample)
+        if denom is None:
+            raise SystemExit(f"Missing total_trimmed_reads for sample {sample} in {trim_counts_tsv}")
+        rel[sample] = rel[sample] / float(denom)
+
+    rel_path = f"{out_prefix}.otu_rel_abundance.tsv"
+    rel.to_csv(rel_path, sep="\t")
+
+    # Taxonomy summaries
+    tax_df = pd.DataFrame({"OTU": otu_count_df.index})
+    tax_df["taxonomy"] = tax_df["OTU"].map(lambda x: otu_tax.get(x, ""))
+    tax_df[["phylum", "family"]] = tax_df["taxonomy"].apply(
+        lambda t: pd.Series(normalize_tax(t))
+    )
+
+    # Merge taxonomy with rel abundance
+    rel_with_tax = tax_df.set_index("OTU").join(rel, how="left")
+
+    def summarize(rank: str) -> pd.DataFrame:
+        tmp = rel_with_tax.copy()
+        tmp[rank] = tmp[rank].fillna("Unassigned")
+        return tmp.groupby(rank)[rel.columns].sum()
+
+    phylum = summarize("phylum")
+    family = summarize("family")
+
+    phylum_path = f"{out_prefix}.phylum_rel_abundance.tsv"
+    family_path = f"{out_prefix}.family_rel_abundance.tsv"
+    phylum.to_csv(phylum_path, sep="\t")
+    family.to_csv(family_path, sep="\t")
+
+    print("Wrote:")
+    print(" ", otu_count_path)
+    print(" ", rel_path)
+    print(" ", phylum_path)
+    print(" ", family_path)
+
+if __name__ == "__main__":
+    if len(sys.argv) != 4:
+        print("Usage: 11_make_otu_tables.py <graftm_out_dir> <trim_read_totals.tsv> <out_prefix>")
+        sys.exit(1)
+    main(sys.argv[1], sys.argv[2], sys.argv[3])
+
+
+## Compute total trimmed reads per library
+
+#!/usr/bin/env python3
+import gzip
+import os
+import sys
+import pandas as pd
+
+def count_fastq_reads(path: str) -> int:
+    opener = gzip.open if path.endswith(".gz") else open
+    n = 0
+    with opener(path, "rt") as f:
+        for _ in f:
+            n += 1
+    return n // 4
+
+def main(samples_tsv: str, trimdir: str, out_tsv: str):
+    samples = pd.read_csv(samples_tsv, sep="\t")
+    rows = []
+    for _, r in samples.iterrows():
+        s = r["sample_id"]
+        r1 = os.path.join(trimdir, s, f"{s}_R1.paired.fq.gz")
+        r2 = os.path.join(trimdir, s, f"{s}_R2.paired.fq.gz")
+        if not (os.path.exists(r1) and os.path.exists(r2)):
+            raise FileNotFoundError(f"Missing trimmed reads for {s}: {r1}, {r2}")
+        total = count_fastq_reads(r1) + count_fastq_reads(r2)
+        rows.append({"sample_id": s, "total_trimmed_reads": total})
+    pd.DataFrame(rows).to_csv(out_tsv, sep="\t", index=False)
+    print(f"Wrote {out_tsv}")
+
+if __name__ == "__main__":
+    if len(sys.argv) != 4:
+        print("Usage: 09_count_trimmed_reads.py metadata/samples.tsv work/00_trim work/10_graftm_16s/trim_read_totals.tsv")
+        sys.exit(1)
+    main(sys.argv[1], sys.argv[2], sys.argv[3])
+
+
+## #!/usr/bin/env python3
+import gzip
+import os
+import sys
+import pandas as pd
+
+def count_fastq_reads(path: str) -> int:
+    opener = gzip.open if path.endswith(".gz") else open
+    n = 0
+    with opener(path, "rt") as f:
+        for _ in f:
+            n += 1
+    return n // 4
+
+def main(samples_tsv: str, trimdir: str, out_tsv: str):
+    samples = pd.read_csv(samples_tsv, sep="\t")
+    rows = []
+    for _, r in samples.iterrows():
+        s = r["sample_id"]
+        r1 = os.path.join(trimdir, s, f"{s}_R1.paired.fq.gz")
+        r2 = os.path.join(trimdir, s, f"{s}_R2.paired.fq.gz")
+        if not (os.path.exists(r1) and os.path.exists(r2)):
+            raise FileNotFoundError(f"Missing trimmed reads for {s}: {r1}, {r2}")
+        total = count_fastq_reads(r1) + count_fastq_reads(r2)
+        rows.append({"sample_id": s, "total_trimmed_reads": total})
+    pd.DataFrame(rows).to_csv(out_tsv, sep="\t", index=False)
+    print(f"Wrote {out_tsv}")
+
+if __name__ == "__main__":
+    if len(sys.argv) != 4:
+        print("Usage: 09_count_trimmed_reads.py metadata/samples.tsv work/00_trim work/10_graftm_16s/trim_read_totals.tsv")
+        sys.exit(1)
+    main(sys.argv[1], sys.argv[2], sys.argv[3])
+
+python3 scripts/09_count_trimmed_reads.py metadata/samples.tsv work/00_trim work/10_graftm_16s/trim_read_totals.tsv
+
+
+## Summarize OTU tables
+
+#!/usr/bin/env bash
+#SBATCH -J otuSum
+#SBATCH -c 4
+#SBATCH --mem=16G
+#SBATCH -t 02:00:00
+#SBATCH -o logs/otuSum_%j.out
+#SBATCH -e logs/otuSum_%j.err
+
+set -euo pipefail
+mkdir -p logs work/10_graftm_16s
+
+python3 scripts/09_count_trimmed_reads.py \
+  metadata/samples.tsv work/00_trim \
+  work/10_graftm_16s/trim_read_totals.tsv
+
+python3 scripts/11_make_otu_tables.py \
+  work/10_graftm_16s \
+  work/10_graftm_16s/trim_read_totals.tsv \
+  work/10_graftm_16s/gg13_8_97
