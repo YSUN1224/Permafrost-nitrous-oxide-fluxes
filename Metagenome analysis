@@ -1,0 +1,24 @@
+# we will create a directory called metagenome_workshop, and everything we do next will be in this directory
+mkdir metagenome_workshop
+cd metagenome_workshop
+
+# you can always use 'pwd' to check the path
+
+mkdir RAW_READS
+cd RAW_READS
+
+## upload sequences to the file 'RAW_READS'
+## examples
+# Sample 1
+ERR011347_1.fastq.gz
+ERR011347_2.fastq.gz
+
+# Sample 2
+ERR011348_1.fastq.gz
+ERR011348_2.fastq.gz
+
+# Unzip the data
+gunzip *.gz
+
+# Back to metagenome_workshop directory
+cd ..
