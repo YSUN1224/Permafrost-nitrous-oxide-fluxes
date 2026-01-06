@@ -1,0 +1,24 @@
+First we will use prodigal to predict genes for each bin.
+
+emacs prodigal_bins.sh 
+#!/bin/bash
+#SBATCH -J prodigal_bins
+#SBATCH -A ACF-UTK0011
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=4
+#SBATCH --ntasks-per-node=8
+#SBATCH --partition=bigmem
+#SBATCH --time=0-2:00:00
+#SBATCH --error=prodigal_bins.e%J
+#SBATCH --output=prodigal_bins.o%J
+#SBATCH --mail-user=your_email_address
+#SBATCH --mail-type=ALL
+module load prodigal/2.6.3 # load prodigal 
+mkdir prodigal
+for s in BIN_REFINEMENT/metawrap_50_10_bins/*.fa;do
+prodigal -a prodigal/$(basename $s .fa).aa.fa -d prodigal/$(basename $s .fa).nuc.fa -i $s -o prodigal/$(basename $s .fa).gff -p meta 
+done
+Submit after binning_refinement is completed. ~1 min run
+
+sbatch prodigal_bins.sh  
+
