@@ -1,0 +1,138 @@
+## 1) Build reference alignment + ML tree (RAxML -f a) and do EPA placement (-f v)
+
+#!/usr/bin/env bash
+#SBATCH -J nosZtree
+#SBATCH -c 16
+#SBATCH --mem=64G
+#SBATCH -t 24:00:00
+#SBATCH -o logs/nosZtree_%j.out
+#SBATCH -e logs/nosZtree_%j.err
+
+set -euo pipefail
+mkdir -p logs
+
+REF_FASTA="${1:-refs/nosZ_rocker_ref.faa}"
+QUERY_FASTA="${2:-queries/nosZ_queries.faa}"
+OUTDIR="${3:-work/30_nosZ_phylogeny}"
+
+THREADS="${THREADS:-${SLURM_CPUS_PER_TASK:-16}}"
+SEED="${SEED:-12345}"
+BOOT="${BOOT:-100}"   # adjust if you used a different number; -f a needs bootstrap replicates
+
+mkdir -p "${OUTDIR}"
+
+# ---- sanity checks ----
+[[ -s "${REF_FASTA}" ]] || { echo "[ERROR] Missing reference FASTA: ${REF_FASTA}"; exit 1; }
+[[ -s "${QUERY_FASTA}" ]] || { echo "[ERROR] Missing query FASTA: ${QUERY_FASTA}"; exit 1; }
+
+# ---- 1) Align references with Clustal Omega (default settings) ----
+REF_ALN="${OUTDIR}/nosZ_ref.aln.faa"
+if [[ ! -s "${REF_ALN}" ]]; then
+  echo "[ClustalO] Aligning reference NosZ proteins..."
+  clustalo \
+    -i "${REF_FASTA}" \
+    -o "${REF_ALN}" \
+    --force
+fi
+
+# ---- 2) Build maximum likelihood reference tree with RAxML (-f a) ----
+# Protein model: PROTGAMMAAUTO lets RAxML pick a reasonable AA model automatically.
+# If you used a fixed model in your paper, replace with e.g., PROTGAMMALG / PROTGAMMAWAG, etc.
+TREE_PREFIX="nosZ_ref"
+if [[ ! -s "${OUTDIR}/RAxML_bestTree.${TREE_PREFIX}" ]]; then
+  echo "[RAxML] Building reference ML tree (-f a)..."
+  raxmlHPC-PTHREADS \
+    -T "${THREADS}" \
+    -f a \
+    -m PROTGAMMAAUTO \
+    -p "${SEED}" \
+    -x "${SEED}" \
+    -N "${BOOT}" \
+    -s "${REF_ALN}" \
+    -n "${TREE_PREFIX}" \
+    -w "$(readlink -f "${OUTDIR}")"
+fi
+
+REF_TREE="${OUTDIR}/RAxML_bestTree.${TREE_PREFIX}"
+[[ -s "${REF_TREE}" ]] || { echo "[ERROR] Missing reference tree: ${REF_TREE}"; exit 1; }
+
+# ---- 3) Add query proteins to the reference alignment using Clustal Omega ----
+# This produces an expanded alignment (ref + queries) with reference columns preserved.
+MERGED_ALN="${OUTDIR}/nosZ_ref_plus_queries.aln.faa"
+if [[ ! -s "${MERGED_ALN}" ]]; then
+  echo "[ClustalO] Adding query sequences to reference alignment..."
+  clustalo \
+    --p1 "${REF_ALN}" \
+    --p2 "${QUERY_FASTA}" \
+    -o "${MERGED_ALN}" \
+    --force
+fi
+
+# ---- 4) EPA placement onto the reference tree with RAxML (-f v) ----
+# -f v does evolutionary placement (EPA) for query sequences.
+# RAxML expects:
+#   -t : fixed reference tree
+#   -s : alignment containing both ref+queries
+# IMPORTANT: Queries must be distinguishable; keep unique FASTA headers.
+EPA_PREFIX="nosZ_epa"
+if [[ ! -s "${OUTDIR}/RAxML_portableTree.${EPA_PREFIX}.jplace" && ! -s "${OUTDIR}/RAxML_jplace.${EPA_PREFIX}" ]]; then
+  echo "[RAxML] EPA placement (-f v)..."
+  raxmlHPC-PTHREADS \
+    -T "${THREADS}" \
+    -f v \
+    -m PROTGAMMAAUTO \
+    -s "${MERGED_ALN}" \
+    -t "${REF_TREE}" \
+    -n "${EPA_PREFIX}" \
+    -w "$(readlink -f "${OUTDIR}")"
+fi
+
+echo "Done."
+echo "Reference alignment: ${REF_ALN}"
+echo "Reference tree:      ${REF_TREE}"
+echo "Merged alignment:    ${MERGED_ALN}"
+echo "EPA outputs in:      ${OUTDIR}"
+
+
+sbatch scripts/30_nosz_phylogeny_ref_and_epa.sbatch \
+  refs/nosZ_rocker_ref.faa \
+  queries/nosZ_queries.faa \
+  work/30_nosZ_phylogeny
+
+## 2）Extract jplace and prepare for iTOL
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+OUTDIR="${1:-work/30_nosZ_phylogeny}"
+GATECH_SCRIPT="${2:-scripts/jplace_to_itol.py}"  # download from enve-omics.ce.gatech.edu and set path
+
+# Find jplace
+JPLACE=""
+if [[ -f "${OUTDIR}/RAxML_portableTree.nosZ_epa.jplace" ]]; then
+  JPLACE="${OUTDIR}/RAxML_portableTree.nosZ_epa.jplace"
+else
+  # try to locate any jplace produced
+  JPLACE=$(ls -1 "${OUTDIR}"/*.jplace 2>/dev/null | head -n 1 || true)
+fi
+
+[[ -n "${JPLACE}" && -s "${JPLACE}" ]] || { echo "[ERROR] jplace file not found in ${OUTDIR}"; exit 1; }
+[[ -s "${GATECH_SCRIPT}" ]] || { echo "[ERROR] GA Tech script not found: ${GATECH_SCRIPT}"; exit 1; }
+
+echo "[iTOL prep] Using jplace: ${JPLACE}"
+
+# Run GA Tech converter (exact CLI depends on script)
+# Many enve-omics scripts accept: input jplace + output prefix
+# If your downloaded script uses different args, run: python3 <script> -h
+python3 "${GATECH_SCRIPT}" \
+  "${JPLACE}" \
+  "${OUTDIR}/itol_nosZ"
+
+echo "Wrote iTOL files with prefix: ${OUTDIR}/itol_nosZ"
+echo "Upload the resulting files to iTOL along with the reference tree."
+
+bash scripts/31_prepare_itol_from_jplace.sh work/30_nosZ_phylogeny /path/to/jplace_to_itol.py
+
+
+
+
