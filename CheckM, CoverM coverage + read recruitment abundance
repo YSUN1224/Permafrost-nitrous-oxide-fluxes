@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SAMPLES_TSV="${1:-metadata/samples.tsv}"
+TRIMDIR="${2:-work/00_trim}"
+BINDIR="${3:-work/02_binning}"
+OUTDIR="${4:-work/04_abundance}"
+THREADS="${THREADS:-16}"
+
+mkdir -p "${OUTDIR}"
+
+groups=$(tail -n +2 "${SAMPLES_TSV}" | cut -f2 | sort -u)
+
+for g in ${groups}; do
+  echo "[coverm] group=${g}"
+
+  bins_dir=$(find "${BINDIR}/${g}/BIN_REFINEMENT" -maxdepth 1 -type d -name "metawrap_*_bins" | head -n 1)
+  [[ -d "${bins_dir}" ]] || { echo "Missing refined bins for ${g}"; exit 1; }
+
+  # build genome list directory for coverm
+  genomes_list="${OUTDIR}/${g}.genomes.list"
+  find "${bins_dir}" -maxdepth 1 -type f -name "*.fa" | sort > "${genomes_list}"
+
+  # Per-sample coverm outputs
+  mapfile -t samples < <(awk -F'\t' -v G="${g}" 'NR>1 && $2==G {print $1}' "${SAMPLES_TSV}")
+
+  for s in "${samples[@]}"; do
+    r1="${TRIMDIR}/${s}/${s}_R1.paired.fq.gz"
+    r2="${TRIMDIR}/${s}/${s}_R2.paired.fq.gz"
+    [[ -f "${r1}" && -f "${r2}" ]] || { echo "Missing reads for ${s}"; exit 1; }
+
+    out_tsv="${OUTDIR}/${g}.${s}.coverm.tsv"
+
+    # count = reads aligned to each MAG
+    # trimmed_mean = trimmed mean depth (5% low/high removed unless overridden)
+    coverm genome \
+      --genome-fasta-list "${genomes_list}" \
+      -1 "${r1}" -2 "${r2}" \
+      --threads "${THREADS}" \
+      --methods count trimmed_mean length \
+      --trim-min 5 --trim-max 95 \
+      --output-file "${out_tsv}"
+  done
+done
+
+echo "Next: run scripts/relative_recruitment.py to compute (mapped_reads / total_filtered_reads)."
