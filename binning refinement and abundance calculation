@@ -1,0 +1,35 @@
+We will select bins with completeness >70% and contamination <10% (-c 70 -x 10).
+
+emacs binning_refinement.sh   
+#!/bin/bash
+#SBATCH -J binning_refinement
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=8
+#SBATCH --partition=bigmem
+#SBATCH --time=0-10:00:00
+#SBATCH --error=binning_refinement.e%J
+#SBATCH --output=binning_refinement.o%J
+#SBATCH --mail-user=your_email_address
+#SBATCH --mail-type=ALL
+conda activate metawrap-env
+metawrap bin_refinement -o BIN_REFINEMENT -t 32 -A INITIAL_BINNING/metabat2_bins/ -B INITIAL_BINNING/maxbin2_bins/ -C INITIAL_BINNING/concoct_bins -c 50 -x 10
+Submit after metawrap_binning is completed. ~1 hour run
+
+sbatch binning_refinement.sh
+
+emacs bin_abundance.sh    
+#!/bin/bash
+#SBATCH -J bin_abundance
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=8
+#SBATCH --partition=bigmem
+#SBATCH --time=0-4:00:00
+#SBATCH --error=bin_abundance.e%J
+#SBATCH --output=bin_abundance.o%J
+#SBATCH --mail-user=your_email_address
+#SBATCH --mail-type=ALL
+conda activate metawrap-env
+metawrap quant_bins -b BIN_REFINEMENT/metawrap_50_10_bins -o QUANT_BINS -a ASSEMBLY_megahit/final_assembly.fasta CLEAN_READS/ERR*fastq
+Submit after binning_refinement is completed. ~5 min run
+
+sbatch bin_abundance.sh
